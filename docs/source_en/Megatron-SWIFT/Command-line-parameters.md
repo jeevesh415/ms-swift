@@ -33,8 +33,9 @@
 - 🔥attention_backend: The attention backend to use (flash, fused, unfused, local, auto). Default is flash.
   - Some models may not support flash attention; you need to manually set `--attention_backend unfused/fused --padding_free false`, for example: Llama4, GPT-OSS.
   - If `flash_attention_3` is installed, specifying `--attention_backend flash` will prioritize using FA3. Refer to the training script [here](https://github.com/modelscope/ms-swift/tree/main/examples/train/flash_attention_3).
-- optimizer: Optimizer type, options are 'adam', 'sgd'. Default is adam.
+- optimizer: Optimizer type. Options include 'adam', 'sgd', 'muon', and 'dist_muon'. Default is 'adam'.
   - Note: This 'adam' is actually 'adamw'. See [here](https://github.com/NVIDIA/TransformerEngine/blob/d8f1e68f7c414f3e7985a8b41de4443b2f819af3/transformer_engine/pytorch/optimizers/fused_adam.py#L69-L70) for reference.
+  - 'muon' and 'dist_muon' require "megatron-core>=0.16".
 - 🔥optimizer_cpu_offload: Offloads optimizer states to the CPU. For example, set: `--use_precision_aware_optimizer true --optimizer_cpu_offload true --optimizer_offload_fraction 0.7`. Defaults to `False`.
   - This parameter can significantly reduce GPU memory usage (at the cost of increased CPU memory consumption). When the `global_batch_size` is large, its impact on training speed is minimal.
 - 🔥optimizer_offload_fraction: The fraction of the optimizer state to offload to CPU. Default is `1.0`.
@@ -93,6 +94,18 @@
 - adam_eps: Default is 1e-8.
 - sgd_momentum: Takes effect when `--optimizer sgd` is set. Defaults to 0.9.
 
+
+**Muon Parameters**:
+
+- muon_momentum: Momentum factor for the Muon optimizer. Default is 0.9.
+- muon_split_qkv: Whether to split QKV parameters for the Muon optimizer. Default is True.
+- muon_use_nesterov: Whether to use Nesterov-style momentum in the internal SGD. Default is False.
+- muon_scale_mode: Scale mode for the Muon optimizer. Options include 'spectral', 'unit_rms_norm', and 'shape_scaling'. Default is 'spectral'.
+- muon_fp32_matmul_prec: FP32 matrix multiplication precision for Newton-Schulz iteration. Options include 'low', 'medium', and 'high'. Default is 'medium'.
+- muon_num_ns_steps: Number of Newton-Schulz steps for the Muon optimizer. Default is 5.
+- muon_tp_mode: NS calculation method for tensor model parallel weights. Options include 'blockwise', 'duplicated', and 'distributed'. Default is 'blockwise'.
+- muon_extra_scale_factor: Additional scale factor for Muon updates. Default is 1.
+
 **Checkpoint Parameters**:
 
 - 🔥output_dir: Output directory for checkpoints, default is None. During training, if this parameter is not set, it defaults to `f'megatron_output/{model_suffix}'`, e.g., `'megatron_output/Qwen2.5-7B-Instruct'`.
@@ -133,8 +146,6 @@ For guidance on selecting parallelization strategies, please refer to the [Train
 - 🔥decoder_first_pipeline_num_layers: The number of Transformer layers in the first pipeline stage of the decoder. Default is None, which means the Transformer layers are evenly distributed across all pipeline stages.
   - This parameter is typically used when **the total number of Transformer layers is not divisible by the pipeline parallelism (PP) size**, or when the first pipeline stage (PP stage 0) of a multimodal model consumes excessive GPU memory.
 - 🔥decoder_last_pipeline_num_layers: The number of Transformer layers in the last pipeline stage of the decoder. Default is None, which means the Transformer layers are evenly distributed across all pipeline stages.
-- account_for_embedding_in_pipeline_split: If set to `True`, the input embedding layer will be treated as a standard Transformer layer in the context of partitioning and placement for pipeline parallelism. The default is `False`.
-- account_for_loss_in_pipeline_split: If set to `True`, the loss layer will be treated as a standard Transformer layer in the context of partitioning and placement for pipeline parallelism. The default is `False`.
 - overlap_p2p_comm: Overlap pipeline parallel communication with forward and backward blocks in 1F1B. Defaults to True.
 - align_param_gather: When set to True, all PP stages will launch parameter all-gather operations simultaneously. Otherwise, each PP stage will launch independently as needed. Defaults to True.
 - 🔥sequence_parallel: Enables sequence parallel optimization; this option takes effect only when `tensor_model_parallel_size` is set. Default is False.
@@ -207,11 +218,13 @@ For guidance on selecting parallelization strategies, please refer to the [Train
 **MTP Parameters**
 - mtp_num_layers: Number of Multi-Token Prediction (MTP) layers. MTP extends the prediction scope at each position to multiple future tokens. This MTP implementation uses D sequential modules to sequentially predict D additional tokens. Default is None. (requires "megatron-core>=0.14")
   - Note: The value of mtp_num_layers will not be automatically retrieved from config.json and must be set manually. You can refer to the `num_nextn_predict_layers` field in config.json to fill in this value. When using mcore-bridge, MTP weights will be loaded from safetensors files first. If not found, random initialization will be performed. (To use blockwise fp8 + mtp, please use mcore>=0.15)
+  - Multimodal MTP support: Requires installing "mcore-bridge>=1.1.0".
 - mtp_loss_scaling_factor: Scaling factor of Multi-Token Prediction (MTP) loss. We compute the average of MTP losses across all depths, then multiply it by this scaling factor to obtain the overall MTP loss, which serves as an additional training objective. Default is 0.1.
 
 **Tuner Parameters**:
 
-- tuner_type: Options are `'lora'` and `'full'`. Default is `'full'`. (**In ms-swift 3.x, the parameter name is `train_type`**)
+- tuner_type: Options include 'lora', 'full', and 'lora_llm'. Defaults to 'full'.
+  - 'lora_llm' means applying LoRA to the LLM part while using 'full' fine-tuning for the ViT/aligner parts. You can set their respective learning rates using `vit_lr/aligner_lr`.
 - 🔥freeze_llm: This argument only takes effect for multimodal models and can be used in both full-parameter and LoRA training, but with different behaviors. In full-parameter training, setting `freeze_llm=True` freezes the LLM component's weights. In LoRA training with `target_modules=['all-linear']`, setting `freeze_llm=True` prevents LoRA modules from being added to the LLM part. Default is `False`.
 - 🔥freeze_vit: This argument only applies to multimodal models and behaves differently depending on the training mode. In full-parameter training, setting `freeze_vit=True` freezes the ViT (vision transformer) component's weights. In LoRA training with `target_modules=['all-linear']`, setting `freeze_vit=True` prevents LoRA modules from being added to the ViT part. Default is `True`.
   - Note: **Here, "vit" refers not only to `vision_tower`, but also to `audio_tower`**. For Omni models, if you want to apply LoRA only to `vision_tower` and not `audio_tower`, you can modify [this code](https://github.com/modelscope/ms-swift/blob/a5d4c0a2ce0658cef8332d6c0fa619a52afa26ff/swift/llm/model/model_arch.py#L544-L554).
@@ -256,12 +269,12 @@ LoRA Training:
 - 🔥offload_bridge: Use CPU main memory to store HF format weights exported by Megatron for vLLM updates, to reduce GPU memory usage. Defaults to False. (Takes effect in GRPO/GKD algorithms)
 
 **Multimodal Parameters**:
-- vit_gradient_checkpointing: Whether to enable gradient checkpointing for the ViT (Vision Transformer) component during multimodal model training. Defaults to `True`. (**The ViT implementation in Megatron-SWIFT uses the Hugging Face `transformers` library.**)
-- attn_impl: When training a multimodal model, sets the `attn_impl` implementation used for the ViT part. Defaults to `'flash_attn'`.
+- vit_gradient_checkpointing: Whether to enable gradient checkpointing for the ViT component during multimodal model training. Defaults to `None`, which means it is enabled when `--freeze_vit` is `false`. (**The ViT implementation in Megatron-SWIFT uses the Hugging Face `transformers` library.**)
+- vit_gradient_checkpointing_kwargs: Arguments passed to `torch.utils.checkpoint`. For example: set `--vit_gradient_checkpointing_kwargs '{"use_reentrant": false}'`. Defaults to `None`. This parameter only takes effect when `vit_gradient_checkpointing` is enabled.
+- vit_attn_impl: When training a multimodal model, sets the `attn_impl` implementation used for the ViT part. Defaults to `'flash_attn'`.
 - vit_lr: Specifies the learning rate for the ViT module when training multimodal models. Default is `None`, same as `learning_rate`. Typically used together with `--freeze_vit` and `--freeze_aligner`.
   - Note: The "learning rate" printed in the logs is the learning rate of the LLM.
 - aligner_lr: Specifies the learning rate for the aligner module in multimodal models. Default is `None`, same as `learning_rate`.
-- gradient_checkpointing_kwargs: Arguments passed to `torch.utils.checkpoint`. For example: set `--gradient_checkpointing_kwargs '{"use_reentrant": false}'`. Defaults to `None`. This parameter only takes effect when `vit_gradient_checkpointing` is enabled.
 
 
 **Other Parameters**:
@@ -374,13 +387,14 @@ In addition to inheriting the training parameters, the following parameters are 
 - overlong_filter: Skip overlong truncated samples, which do not participate in loss calculation. Default is False.
 - delta: Bilateral GRPO upper bound clipping value from the [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291). If set, it is recommended to be greater than 1 + epsilon. Default is None.
 - importance_sampling_level: Controls importance sampling ratio calculation. Options are `token` and `sequence`. In `token` mode, the original log probability ratio for each token is preserved. In `sequence` mode, the log probability ratios of all valid tokens in the sequence are averaged. The [GSPO paper](https://arxiv.org/abs/2507.18071) uses sequence-level calculation to stabilize training. Default is `token`.
-- scale_rewards: Specifies the reward scaling strategy. Options include `group` (scale by within-group standard deviation), `batch` (scale by batch-wide standard deviation), `none` (no scaling), and `gdpo` (normalize each reward function separately within groups before weighted aggregation, see [GDPO paper](https://arxiv.org/abs/2601.05242)). In ms-swift < 3.10, this parameter is boolean, where `true` corresponds to `group` and `false` corresponds to `none`. The default value is bound to `advantage_estimator`: `grpo` corresponds to `group`, `rloo` corresponds to `none`, and `reinforce_plus_plus` corresponds to `batch`.
+- scale_rewards: Specifies the reward scaling strategy. Options include `group` (scale by within-group standard deviation), `batch` (scale by batch-wide standard deviation), `none` (no scaling), and `gdpo` (normalize each reward function separately within groups before weighted aggregation, see [GDPO paper](https://arxiv.org/abs/2601.05242)). The default value is bound to `advantage_estimator`: `grpo` corresponds to `group`, `rloo` corresponds to `none`, and `reinforce_plus_plus` corresponds to `batch`.
   - Note: `gdpo` mode does not support `kl_in_reward=True`. If both are set, `kl_in_reward` will be automatically set to `False`.
   - GDPO is designed for multi-reward optimization: When using multiple reward functions, GDPO normalizes each reward function separately within groups (subtract mean, divide by std), then performs weighted aggregation using `reward_weights`, and finally applies batch-level normalization. This approach better preserves the relative differences between rewards and prevents different reward combinations from collapsing into identical advantage values.
 - rollout_importance_sampling_mode: Training-inference mismatch correction mode. Options are `token_truncate`, `token_mask`, `sequence_truncate`, `sequence_mask`. Default is None (disabled). For details, refer to the [documentation](../Instruction/GRPO/AdvancedResearch/training_inference_mismatch.md).
 - rollout_importance_sampling_threshold: Threshold for importance sampling weights, used for truncating or masking extreme weights. Default is 2.0.
 - log_rollout_offpolicy_metrics: Whether to log training-inference mismatch diagnostic metrics (KL, PPL, χ², etc.) when `rollout_importance_sampling_mode` is not set. When `rollout_importance_sampling_mode` is set, metrics are always logged. Default is False.
 - off_policy_sequence_mask_delta: Off-Policy Sequence Masking threshold from [DeepSeek-V3.2 paper](https://arxiv.org/abs/2512.02556). When set, computes `mean(old_policy_logps - policy_logps)` for each sequence. If this value exceeds the threshold AND the sequence has negative advantage, the sequence is masked out from loss computation. For details, refer to the [documentation](../Instruction/GRPO/AdvancedResearch/training_inference_mismatch.md#off-policy-sequence-masking).
+- router_replay_mode: Router replay mode. Options are `disabled`,`R2`,`R3`. Default is disabled.
 
 Built-in reward function parameters refer to the [documentation](../Instruction/Command-line-parameters.md#reward-function-parameters).
 

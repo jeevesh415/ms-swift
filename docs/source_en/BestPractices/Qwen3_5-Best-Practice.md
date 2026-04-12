@@ -1,16 +1,19 @@
 # Qwen3.5 Best Practices
 
-ms-swift 4.0 supports training [Qwen3.5](https://github.com/QwenLM/Qwen3.5) Dense/MoE models using transformers/Megatron backends. Qwen3.5 is a multimodal model with hybrid thinking, combining linear attention and full attention. This article will introduce how to perform inference, instruction fine-tuning, and reinforcement learning on Qwen3.5 Dense/MoE models.
+ms-swift supports training [Qwen3.5](https://github.com/QwenLM/Qwen3.5) Dense/MoE models using transformers/Megatron backends. Qwen3.5 is a multimodal model with hybrid thinking, combining linear attention and full attention. This article will introduce how to perform inference, instruction fine-tuning, and reinforcement learning on Qwen3.5 Dense/MoE models.
 
 ## Environment Setup
 
 ```shell
 pip install -U ms-swift
-pip install -U "transformers>=5.2.0" "qwen_vl_utils>=0.0.14" peft liger-kernel
+# "transformers==5.2.*" encounters compatibility issues with vllm. See this issue: https://github.com/modelscope/ms-swift/issues/8254
+# "transformers==5.3.*" encounters video training issues. See this issue: https://github.com/modelscope/ms-swift/issues/8362
+pip install -U "transformers==5.2.*" "qwen_vl_utils>=0.0.14" peft liger-kernel
 
 # flash-linear-attention
-# Please install the fla main branch. If you encounter slow training issues, please refer to: https://github.com/fla-org/flash-linear-attention/issues/758
-pip install -U git+https://github.com/fla-org/flash-linear-attention
+# If you encounter slow training issues, please refer to: https://github.com/fla-org/flash-linear-attention/issues/758
+# Please use Python 3.12: https://github.com/fla-org/flash-linear-attention/issues/121
+pip install -U "flash-linear-attention>=0.4.2" --no-build-isolation
 
 # causal_conv1d
 pip install -U git+https://github.com/Dao-AILab/causal-conv1d --no-build-isolation
@@ -24,7 +27,7 @@ pip install deepspeed
 # vllm (torch2.10) for inference/deployment/RL
 pip install -U "vllm>=0.17.0"
 # For RL training, need to override vllm's default installation version
-pip install -U "transformers>=5.2.0"
+pip install -U "transformers==5.2.*"
 ```
 
 - Qwen3.5 video data training hangs: Using the decord backend to read videos may cause hanging issues, refer to [this issue](https://github.com/dmlc/decord/issues/269). You can use the torchcodec backend, specifically refer to the [qwen_vl_utils](https://github.com/QwenLM/Qwen3-VL/blob/50068df2334f309979ff05d75f1078c8309c63ed/qwen-vl-utils/src/qwen_vl_utils/vision_process.py#L390-L400) library.
@@ -102,15 +105,14 @@ Qwen3.5's bbox output uses normalized relative coordinates with a scale of 1000.
 ### Dense Models
 
 Below is a fine-tuning script for the Qwen3.5-4B model. This example script is for demonstration purposes only. Training memory usage is 4 × 20GiB, with a training time of 12 minutes. Since transformers' GatedDeltaNet does not support packing/padding_free (Megatron does support it, see below), we use the `group_by_length` parameter to accelerate training, ensuring load balancing across data parallelism (DP) and reducing zero-padding in micro batches. However, this may cause fluctuations in the loss curve due to insufficient data shuffling. You can also remove this parameter if preferred.
-
-The fine-tuning script is as follows:
+- Regarding data preprocessing: When using the packing / group_by_length parameters, all data must be preprocessed in advance to obtain the input_ids length of each sample, which takes additional time. If you prefer to process data on-the-fly during training, you can remove these two parameters.
 
 ```shell
 # 4 * 20GiB
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 NPROC_PER_NODE=4 \
-MAX_PIXELS=1003520 \
-VIDEO_MAX_PIXELS=50176 \
+IMAGE_MAX_TOKEN_NUM=1024 \
+VIDEO_MAX_TOKEN_NUM=128 \
 FPS_MAX_FRAMES=12 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 swift sft \
@@ -153,8 +155,8 @@ After training, use the following script to perform inference on the validation 
 ```shell
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 CUDA_VISIBLE_DEVICES=0 \
-MAX_PIXELS=1003520 \
-VIDEO_MAX_PIXELS=50176 \
+IMAGE_MAX_TOKEN_NUM=1024 \
+VIDEO_MAX_TOKEN_NUM=128 \
 FPS_MAX_FRAMES=12 \
 swift infer \
     --adapters output/Qwen3.5-4B/vx-xxx/checkpoint-xxx \
@@ -232,8 +234,8 @@ Qwen3.5-35B-A3B Megatron training. For environment preparation, please refer to 
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 NPROC_PER_NODE=4 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-MAX_PIXELS=1003520 \
-VIDEO_MAX_PIXELS=50176 \
+IMAGE_MAX_TOKEN_NUM=1024 \
+VIDEO_MAX_TOKEN_NUM=128 \
 FPS_MAX_FRAMES=12 \
 megatron sft \
     --model Qwen/Qwen3.5-35B-A3B \
@@ -291,8 +293,8 @@ After training, use the following script to perform inference on the validation 
 ```shell
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-MAX_PIXELS=1003520 \
-VIDEO_MAX_PIXELS=50176 \
+IMAGE_MAX_TOKEN_NUM=1024 \
+VIDEO_MAX_TOKEN_NUM=128 \
 FPS_MAX_FRAMES=12 \
 swift infer \
     --model megatron_output/Qwen3.5-35B-A3B/vx-xxx/checkpoint-xxx-merged \
@@ -303,12 +305,12 @@ swift infer \
 ```
 
 Tips for training Qwen3.5 with Megatron-SWIFT:
-
-- Full parameter training: Refer to [this example](https://github.com/modelscope/ms-swift/tree/main/examples/models/qwen3_5/mcore_full.sh).
-- Regarding MTP training: ms-swift currently does not support multimodal MTP training. If you are only training on pure text data, please set the `SKIP_MULTIMODAL_MTP_VALIDATION=1` environment variable to skip the validation check.
+- Full parameter training: Refer to [this example](https://github.com/modelscope/ms-swift/blob/main/examples/models/qwen3_5/packing.sh).
+- Regarding MTP training: `mcore-bridge>=1.1.0` supports multimodal MTP training (currently requires installing the [main branch](https://github.com/modelscope/mcore-bridge/pull/14)). Please install the corresponding version.
 - TP Limitation Removed: Using `megatron-core>=0.16` removes the `num_query_groups` limitation on TP.
-- By default, `GatedDeltaNet` uses the transformers implementation (to ensure stability, the default behavior remains unchanged for now). Using `megatron-core>=0.16` and setting the environment variable `SWIFT_USE_MCORE_GDN=1` switches to the mcore implementation, which supports TP for GDN and reduces memory usage.
-- Support for padding_free/packing: Packing can improve training speed. You need to set the `SWIFT_USE_MCORE_GDN=1` environment variable. Refer to [this example](https://github.com/modelscope/ms-swift/tree/main/examples/models/qwen3_5/packing.sh).
+- CP support: "mcore-bridge>=1.1.0" supports CP training for GDN (currently requires installing the [main branch](https://github.com/modelscope/mcore-bridge/pull/16)). Additionally, the megatron-core dev branch needs to be installed.
+- By default, `GatedDeltaNet` uses the Megatron implementation, which requires "megatron-core>=0.16" (ms-swift>=4.1.0; previous versions defaulted to the transformers implementation). Set the environment variable `USE_MCORE_GDN=0` to switch to the transformers implementation. Note that the transformers implementation does not support packing and GDN's TP.
+- Support for padding_free/packing: Packing can improve training speed. Refer to [this example](https://github.com/modelscope/ms-swift/tree/main/examples/models/qwen3_5/packing.sh).
 - apply_wd_to_qk_layernorm: Apply weight decay to qk layernorm. Default is False.
 
 
