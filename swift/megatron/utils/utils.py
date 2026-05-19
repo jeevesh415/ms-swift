@@ -23,8 +23,6 @@ from swift.tuners import LoraConfig, Swift
 from swift.utils import (activate_parameters, deep_getattr, find_layers, freeze_parameters, get_logger,
                          get_model_parameter_info)
 
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
-
 logger = get_logger()
 
 
@@ -222,10 +220,11 @@ def get_padding_to(args):
         padding_to = (padding_to or 1) * args.context_parallel_size
     origin_padding_to = padding_to
     fp8_format = getattr(args, 'fp8_format', None) or getattr(args, 'fp8', None)
+    fp4_format = getattr(args, 'fp4_format', None) or getattr(args, 'fp4', None)
     if args.fp8_recipe == 'blockwise':
         padding_to = (padding_to or 1) * 128
-    elif fp8_format is not None:
-        padding_to = max((padding_to or 1) * 8, 16)
+    elif fp8_format is not None or fp4_format is not None:
+        padding_to = (padding_to or 1) * 16
     if args.attention_backend == 'fused':
         padding_to = max(padding_to or 1, ((origin_padding_to) or 1) * 64)
     return padding_to

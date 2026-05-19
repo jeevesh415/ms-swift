@@ -17,7 +17,6 @@ from swift.megatron.utils import initialize_megatron
 from swift.model import get_model_info_meta
 from swift.utils import get_dist_setting, get_logger, json_parse_to_dict
 
-mcore_015 = version.parse(megatron.core.__version__) >= version.parse('0.15.0rc0')
 mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 logger = get_logger()
 
@@ -76,6 +75,15 @@ class RLHFMegatronArgumentsMixin:
     # Temperature parameters for soft adaptive gate
     tau_pos: float = 1.0
     tau_neg: float = 1.05
+
+    # REAL https://arxiv.org/abs/2602.05630
+    real_tau: float = 0.5
+
+    # FIPO https://arxiv.org/abs/2603.19835
+    fipo_decay_rate: float = 32.0
+    fipo_clip_range: Optional[float] = 0.2
+    fipo_clip_high_only: bool = True
+    fipo_safety_threshold: Optional[float] = 4.0
 
     epsilon: float = 0.2
     epsilon_high: Optional[float] = None
@@ -237,8 +245,62 @@ class RLHFMegatronArgumentsMixin:
             if self.gkd_logits_topk is not None and self.gkd_logits_topk <= 0:
                 raise ValueError(f'gkd_logits_topk must be a positive integer, got {self.gkd_logits_topk}')
 
+            self.num_generations = 1
+            self._init_generation_batch_params()
+
         if self.rlhf_type in ['grpo', 'gkd']:
             self.vllm_engine_kwargs = json_parse_to_dict(self.vllm_engine_kwargs)
+
+    def _init_generation_batch_params(self):
+        if self.generation_batch_size is None and self.steps_per_generation is None:
+            self.steps_per_generation = 1
+            self.generation_batch_size = self.global_batch_size * self.steps_per_generation
+        elif self.generation_batch_size is not None and self.steps_per_generation is not None:
+            expected = self.global_batch_size * self.steps_per_generation
+            if self.generation_batch_size != expected:
+                raise ValueError(f'generation_batch_size ({self.generation_batch_size}) must equal '
+                                 f'global_batch_size ({self.global_batch_size}) * steps_per_generation '
+                                 f'({self.steps_per_generation}) = {expected}.')
+        elif self.generation_batch_size is not None:
+            if self.generation_batch_size % self.global_batch_size != 0:
+                raise ValueError(f'generation_batch_size ({self.generation_batch_size}) '
+                                 f'must be divisible by global_batch_size ({self.global_batch_size})')
+            self.steps_per_generation = self.generation_batch_size // self.global_batch_size
+        else:
+            self.generation_batch_size = self.global_batch_size * self.steps_per_generation
+
+        if self.steps_per_generation <= 0:
+            raise ValueError(f'steps_per_generation must be > 0, got {self.steps_per_generation}.')
+
+        if self.num_generations > 1 and self.generation_batch_size % self.num_generations != 0:
+            raise ValueError(f'generation_batch_size ({self.generation_batch_size}) must be divisible by '
+                             f'num_generations ({self.num_generations}).')
+
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            dp_size = world_size // (
+                self.pipeline_model_parallel_size * self.tensor_model_parallel_size * self.context_parallel_size)
+            num_rollout_prompt = self.generation_batch_size // self.num_generations
+            if num_rollout_prompt % dp_size != 0:
+                raise ValueError(f'num_rollout_prompt ({num_rollout_prompt}) = generation_batch_size '
+                                 f'({self.generation_batch_size}) // num_generations ({self.num_generations}) '
+                                 f'must be divisible by dp_size ({dp_size}).')
+
+            per_device_num_rollout_prompt = num_rollout_prompt // dp_size
+            if per_device_num_rollout_prompt < 1:
+                raise ValueError(f'per_device_num_rollout_prompt ({per_device_num_rollout_prompt}) must be >= 1, '
+                                 f'please adjust generation_batch_size/steps_per_generation/num_generations.')
+
+            if per_device_num_rollout_prompt % self.micro_batch_size != 0:
+                raise ValueError(f'Per-device rollout prompt count ({per_device_num_rollout_prompt}) = '
+                                 f'(generation_batch_size ({self.generation_batch_size}) // '
+                                 f'num_generations ({self.num_generations})) // dp_size ({dp_size}) '
+                                 f'must be divisible by micro_batch_size ({self.micro_batch_size}).')
+
+            self.per_device_generation_batch_size = self.generation_batch_size // world_size
+            if self.per_device_generation_batch_size < 1:
+                raise ValueError(
+                    f'per_device_generation_batch_size ({self.per_device_generation_batch_size}) must be >= 1.')
 
     def _init_grpo(self):
 
@@ -247,62 +309,20 @@ class RLHFMegatronArgumentsMixin:
                 raise ValueError('async_generate is not supported for Megatron GRPO right now')
             if self.sync_ref_model:
                 raise ValueError('sync_ref_model is not supported for Megatron GRPO right now')
-            if not self.dataset_shuffle:
-                raise ValueError('dataset_shuffle false is not supported for Megatron GRPO')
             if self.multi_turn_scheduler:
                 raise ValueError('multi_turn_scheduler is not supported for Megatron GRPO right now')
             if self.num_iterations > 1:
                 raise ValueError('num_iterations > 1 is not supported for Megatron GRPO right now')
 
-        def _check_batch_params():
-            # Set default values if both are None
-            if self.generation_batch_size is None and self.steps_per_generation is None:
-                self.steps_per_generation = 1
-                self.generation_batch_size = self.global_batch_size * self.steps_per_generation
-            # Both configured - error
-            elif self.generation_batch_size is not None and self.steps_per_generation is not None:
-                raise ValueError("'generation_batch_size' and 'steps_per_generation' cannot be both configured")
-            # Only generation_batch_size configured
-            elif self.generation_batch_size is not None:
-                if self.generation_batch_size % self.global_batch_size != 0:
-                    raise ValueError(f'generation_batch_size ({self.generation_batch_size}) '
-                                     f'must be divisible by global_batch_size ({self.global_batch_size})')
-                self.steps_per_generation = self.generation_batch_size // self.global_batch_size
-            # Only steps_per_generation configured
-            else:
-                self.generation_batch_size = self.global_batch_size * self.steps_per_generation
-
-            world_size = torch.distributed.get_world_size()
-            dp_size = world_size // (
-                self.pipeline_model_parallel_size * self.tensor_model_parallel_size * self.context_parallel_size)
-            num_rollout_prompt = self.generation_batch_size // self.num_generations
-            if num_rollout_prompt % dp_size != 0:
-                raise ValueError(f'num_rollout_prompt ({num_rollout_prompt}) = generation_batch_size '
-                                 f'({self.generation_batch_size}) // num_generations ({self.num_generations}) '
-                                 f'must be divisible by dp_size ({dp_size}). '
-                                 f'Please adjust generation_batch_size/steps_per_generation/num_generations.')
-
-            per_device_num_rollout_prompt = num_rollout_prompt // dp_size
-            assert per_device_num_rollout_prompt >= 1, \
-                (f'per_device_num_rollout_prompt ({per_device_num_rollout_prompt}) must be greater than 1, '
-                 f'please adjust generation_batch_size/steps_per_generation/num_generations to make it greater than 1')
-
-            if per_device_num_rollout_prompt % self.micro_batch_size != 0:
-                raise ValueError(f'Per-device rollout prompt count ({per_device_num_rollout_prompt}) = '
-                                 f'(generation_batch_size ({self.generation_batch_size}) // '
-                                 f'num_generations ({self.num_generations})) // dp_size ({dp_size}) '
-                                 f'must be divisible by micro_batch_size ({self.micro_batch_size}). '
-                                 f'Please adjust arguments to satisfy: '
-                                 f'(generation_batch_size // num_generations) // dp_size % '
-                                 f'micro_batch_size == 0')
-
-            self.per_device_generation_batch_size = self.generation_batch_size // world_size
-            assert self.per_device_generation_batch_size >= 1, \
-                (f'per_device_generation_batch_size ({self.per_device_generation_batch_size}) must be greater than 1, '
-                 f'please adjust generation_batch_size/steps_per_generation/num_generations to make it greater than 1')
+            if self.loss_type == 'real':
+                assert self.micro_batch_size % self.num_generations == 0, \
+                    (f'"REAL loss requires that the training micro_batch_size ({self.micro_batch_size}) '
+                     f'is a multiple of num_generations ({self.num_generations}). Please adjust your batch parameters.')
 
         _check_not_supported()
-        _check_batch_params()
+        if self.dataset_shuffle is not None:
+            self.train_dataloader_shuffle = self.dataset_shuffle
+        self._init_generation_batch_params()
         self.remove_unused_columns = False
         logger.info(f'Setting args.remove_unused_columns: {self.remove_unused_columns}')
         if self.truncation_strategy is None:
@@ -310,6 +330,13 @@ class RLHFMegatronArgumentsMixin:
         if self.truncation_strategy not in {'left', 'delete'}:
             raise ValueError("GRPO requires `truncation_strategy 'left' or 'delete'`, "
                              f"Current value: `truncation_strategy='{self.truncation_strategy}'`.")
+        # disable normalization, REAL https://arxiv.org/abs/2602.05630
+        if self.loss_type == 'real':
+            self.scale_rewards = 'none'
+            logger.warning(
+                f"[REAL] scale_rewards='{self.scale_rewards}' is ignored. "
+                "It will be forced to 'none' because 'loss_type = real' does not support reward normalization.")
+
         if self.beta is None:
             self.beta = 0.04  # https://arxiv.org/abs/2402.03300
         if self.async_generate:
@@ -396,7 +423,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     train_dataloader_shuffle: bool = True
     dataloader_num_workers: int = 4
     dataloader_pin_memory: bool = True
-    dataloader_persistent_workers: bool = True
+    dataloader_persistent_workers: bool = False
     dataloader_prefetch_factor: int = 2
     data_sharding: bool = False
     group_by_length: bool = False
@@ -503,9 +530,14 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     # fp8
     fp8_format: Literal['e4m3', 'hybrid'] = None
     fp8_recipe: Literal['tensorwise', 'delayed', 'mxfp8', 'blockwise'] = 'delayed'
+    fp8_param_gather: bool = False
     fp8_amax_history_len: int = 1024
     fp8_amax_compute_algo: Literal['most_recent', 'max'] = 'max'
-    fp8_param_gather: bool = False
+
+    # fp4
+    fp4_format: Literal['e2m1'] = None
+    fp4_recipe: Literal['nvfp4'] = 'nvfp4'
+    fp4_param_gather: bool = False
 
     # mixed precision
     fp16: Optional[bool] = None
@@ -532,6 +564,8 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     # mtp
     mtp_num_layers: Optional[int] = None
     mtp_loss_scaling_factor: float = 0.1
+    mtp_decoder_input_detach: bool = False
+    mtp_shared_weights: bool = False
 
     # mcore-bridge
     model: Optional[str] = None
@@ -563,6 +597,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     torch_dtype: Optional[Union[torch.dtype, str]] = None
     rope_scaling: Optional[Union[dict, str]] = None
     apply_wd_to_qk_layernorm: bool = False
+    linear_decoupled_in_proj: bool = False
 
     enable_dft_loss: bool = False
     enable_channel_loss: bool = False
@@ -593,8 +628,15 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         return res
 
     def _set_default(self):
-        if self.mlp_padding_free and (self.sequence_parallel or self.context_parallel_size > 1):
-            raise ValueError('mlp_padding_free is not compatible with sequence parallel or context parallel.')
+        if self.mlp_padding_free:
+            if self.sequence_parallel:
+                require_version(
+                    'mcore-bridge>=1.3.0.dev',
+                    'Please install mcore-bridge>=1.3.0.dev to use mlp_padding_free with sequence parallel.')
+            if self.context_parallel_size > 1:
+                require_version(
+                    'mcore-bridge>=1.4.0.dev',
+                    'Please install mcore-bridge>=1.4.0.dev to use mlp_padding_free with context parallel.')
         if self.local_rank is None:
             self.local_rank = get_dist_setting()[1]
         if self.lr is None:
@@ -614,12 +656,16 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         if self.apply_query_key_layer_scaling:
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
 
+    def _check_mcore_bridge(self):
+        pass
+
     def __post_init__(self):
         if self.tuner_type != 'full':
             require_version('peft>=0.15', 'Please install peft>=0.15 to use LoRA in Megatron-SWIFT.')
         RLHFMegatronArgumentsMixin.__post_init__(self)
         MegatronTunerMixin.__post_init__(self)
         os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+        self._check_mcore_bridge()
         if self.recompute_granularity == 'none':
             self.recompute_granularity = None
         if self.recompute_granularity == 'selective' and self.recompute_method is not None:
@@ -659,7 +705,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
                                                        or self.decoder_last_pipeline_num_layers is not None):
             raise ValueError('pipeline_model_parallel_size must be greater than 1 if you want to set '
                              'decoder_first_pipeline_num_layers or decoder_last_pipeline_num_layers.')
-        self.fp8 = self.fp8_format  # compat megatron-lm
+        # compat megatron-core
+        self.fp8 = self.fp8_format
+        self.fp4 = self.fp4_format
+
         if self.task_type not in {'causal_lm', 'generative_reranker'}:
             self.untie_embeddings_and_output_weights = True
         if self.vit_gradient_checkpointing_kwargs is not None:
@@ -787,7 +836,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         adapter_config_path = os.path.join(adapter_path, 'adapter_config.json')
         adapter_config = {}
         if os.path.exists(adapter_config_path):
-            with open(adapter_config_path, 'r') as f:
+            with open(adapter_config_path, 'r', encoding='utf-8') as f:
                 adapter_config = json.load(f)
         mapping = {'r': 'lora_rank', 'bias': 'lora_bias'}
         for k in ['lora_alpha', 'lora_dropout', 'use_rslora']:
@@ -876,7 +925,6 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             self.torch_dtype = torch.bfloat16
             if self.main_grads_dtype == torch.float32:
                 self.accumulate_allreduce_grads_in_fp32 = True
-        self.params_dtype = self.torch_dtype
 
     def _init_weigh_decay(self):
         if self.weight_decay_incr_style == 'constant':
